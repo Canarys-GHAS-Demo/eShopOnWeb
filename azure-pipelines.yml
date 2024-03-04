@@ -1,0 +1,137 @@
+# This sample YAML file shows how to configure an Azure Pipeline to analyze a repository using the CodeQL CLI Bundle
+
+# When a repository is stored in GitHub
+# To run Codeql in azure repos see: https://learn.microsoft.com/en-us/azure/devops/repos/security/github-advanced-security-code-scanning?view=azure-devops
+# This example assumes a Linux environment
+
+# The pipeline needs have a variable called GITHUB_TOKEN (don't forget to set it as secret)
+# This secret will contain a personal access token. Either classic or fine grained (preferably)
+# The Clasic token requires the following scopes: Repo
+# The fine grained token requires the following permissions: Code scanning alerts (read and write)
+
+# Adapt the trigger to your needs
+trigger:
+    branches:
+      include:
+      - '*'
+    paths:
+      exclude:
+      - test/*
+      - doc/*
+      - lib/*
+      include:
+      - src/*
+pr:
+ branches:
+  include:
+    - main
+variables:
+  # Language to scan. Possible values
+  #   cpp, csharp, go, java, javascript, python, ruby, swift
+  language: csharp 
+
+stages:
+- stage:
+  jobs:
+    - job:
+      displayName: CodeQL analyze
+
+      pool:
+        vmImage: 'ubuntu-latest'
+      workspace:
+          clean: all
+      steps:
+
+        # OPTIONAL: Download CodeQL CLI Bundle
+        # The CodeQL bundle (containing the CodeQL CLI as well as the pre-compiled CodeQL Query Suites, which is recommended for CI/CD integration) can either be download as part of the pipeline,
+        # or pre-downloaded and placed on the CI/CD build machine(s). In this example, we download the latest CLI bundle (at time of writing) as part of the pipeline from
+        # https://github.com/github/codeql-action/releases, extract it and place it on the PATH.
+        - script: |          
+              wget https://github.com/github/codeql-action/releases/latest/download/codeql-bundle-linux64.tar.gz \
+                -O ../codeql-bundle-linux64.tar.gz \
+                --show-progress \
+                --progress=dot:mega 
+
+              tar xzvf ../codeql-bundle-linux64.tar.gz -C ../
+              rm ../codeql-bundle-linux64.tar.gz
+
+              # Make sure CLI is on the path
+              cli_path="$(cd ..; pwd)/codeql"
+               echo "##vso[task.prependpath]$cli_path"
+          displayName: Download CodeQL CLI Bundle
+
+        # Create CodeQL Database
+        # Create a CodeQL database for a source tree that can be analyzed using one of the CodeQL products.
+        # Note that if the --command flag is omitted for compiled languages, the AutoBuilder will be used. For complex build instructions, consider placing build commands inside a script
+        # and pass that to --command, or use indirect build tracing (aka. "sandwich mode").
+        # Full documentation for database create step: https://codeql.github.com/docs/codeql-cli/manual/database-create/
+        - script: |
+            codeql database create db \
+              --language=$(language) \
+              --github-url=https://github.com/
+
+          displayName: Create CodeQL Database
+
+        # Analyze CodeQL Database
+        # Analyze a CodeQL database, producing meaningful results in the context of the source code.
+        # Run a query suite (or some individual queries) against a CodeQL database, producing results, styled as alerts or paths, in SARIF or another interpreted format.
+        # Note that the suite argument can accept one of the pre-compiled, out-of-the-box query suites: code-scanning, security-extended, or security-and-quality
+        # Full documentation for database analyze step: https://codeql.github.com/docs/codeql-cli/manual/database-analyze/
+        - script: |
+            codeql database analyze \
+              --format=sarif-latest\
+              --sarif-category="$(language)" \
+              --sarif-add-baseline-file-info \
+              --output="tailspin.sarif" \
+              db $(language)-security-and-quality.qls
+          displayName: Analyze CodeQL Database
+            
+        # Upload results to GitHub
+        # Uploads a SARIF file to GitHub code scanning.
+        # For context, please see https://docs.github.com/en/rest/reference/code-scanning#upload-an-analysis-as-sarif-data
+        # A GitHub Apps token or personal access token must be set. For best security practices, it is recommended to set the --github-auth-stdin flag and pass the token to the command through standard input. Alternatively, the GITHUB_TOKEN environment variable can be set.
+        # This token must have the security\_events scope.
+        # Documentation for creating GitHub Apps or Personal Access Tokens are available here: https://docs.github.com/en/free-pro-team@latest/github/authenticating-to-github/creating-a-personal-access-token
+        # Full documentation for github upload-results step: https://codeql.github.com/docs/codeql-cli/manual/github-upload-results/
+        - script: |
+            echo ""
+            codeql github upload-results \
+              --sarif="tailspin.sarif" \
+              --github-url=https://github.com/ \
+              --repository="$(Build.Repository.Name)" \
+              --ref="$(Build.SourceBranch)" \
+              --commit="$(Build.SourceVersion)"
+          displayName: Upload results to GitHub $(Build.Repository.Name)
+          env:
+            GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+        - script: |
+            alerts=$(jq '.runs[].results | length > 0' tailspin.sarif); if [ "$alerts" = "true" ]; then echo "Alerts identified. Failing the script." && exit 1; fi
+        
+        # - script: |
+        #       REPO=$(echo $BUILD_REPOSITORY_NAME | tr "/" "\n")
+        #       OWNER=$(echo $REPO | awk 'NR==1')
+        #       REPO_NAME=$(echo $REPO | awk 'NR==2') 
+        #       PR_NUMBER=$System.PullRequest.PullRequestNumber 
+        #       GITHUB_TOKEN=${GITHUB_TOKEN}
+        #       SARIF_FILE=tailspin.sarif
+        #       alerts=$(jq -r '.runs[].results[] | select(.level == "error") | "\(.ruleId) in \(.locations[].physicalLocation.artifactLocation.uri) at \(.locations[].physicalLocation.region.startLine):\(.locations[].physicalLocation.region.startColumn)"' tailspin.sarif)
+        #       if [ "$alerts" ]; then
+        #         # Use jq to construct the JSON payload safely, including the comment body
+        #         json_payload=$(jq -n --arg body "### Code Analysis Results\n\`\`\`\n$alerts\n\`\`\`" '{body: $body}')
+        #         # Post the comment to the GitHub PR using the constructed JSON payload
+        #         curl -s -H "Authorization: token $GITHUB_TOKEN" \
+        #             -H "Content-Type: application/json" \
+        #             -X POST \
+        #             -d "$json_payload" \
+        #             "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/issues/$PR_NUMBER/comments"
+                
+        #         echo "Alerts Found, Added to GitHub PR"
+        #         exit 1
+        #       fi
+
+        - task: PublishPipelineArtifact@1
+          inputs:
+            targetPath: '$(Pipeline.Workspace)'
+            artifact: 'sarif file'
+            publishLocation: 'pipeline'
